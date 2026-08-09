@@ -49,3 +49,18 @@ def test_find_pip_cuda_home_locates_nvcc_under_site_packages(tmp_path: Path):
 
 def test_find_pip_cuda_home_returns_none_when_absent(tmp_path: Path):
     assert find_pip_cuda_home(tmp_path) is None
+
+
+def test_build_serve_args_omits_eviction_flags_when_disabled():
+    args = build_serve_args(MODEL, SMALL_HW)
+    assert "--model-class-overrides" not in args
+    assert "--scheduler-cls" not in args
+
+
+def test_build_serve_args_includes_eviction_flags_when_enabled():
+    args = build_serve_args(MODEL, SMALL_HW, sink_len=64, recent_window=256)
+    assert "--model-class-overrides" in args
+    override_value = args[args.index("--model-class-overrides") + 1]
+    assert "serving.eviction.sink_model:SinkQwen3ForCausalLM" in override_value
+    assert "Qwen3ForCausalLM" in override_value
+    assert args[args.index("--scheduler-cls") + 1] == "serving.eviction.sink_scheduler:SinkScheduler"
