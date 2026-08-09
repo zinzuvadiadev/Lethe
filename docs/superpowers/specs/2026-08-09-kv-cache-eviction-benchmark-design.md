@@ -46,7 +46,49 @@ Two decisions fell directly out of hardware/software reality, not preference:
   — uses attention-sink protection as its reference implementation for exactly this
   reason.
 
-## 3. System architecture
+## 3. Model & hardware modularity
+
+The goal is as much benchmark data as possible, not one model on one machine.
+Today's environment is the RTX 5070 (8GB) laptop; a second machine with an RTX
+4090 (24GB) becomes available once the tool is working end-to-end there. Rather
+than hardcode a model name/quantization/GPU assumption into `/serving/`,
+`/loadgen/`, and `/eval/`, both are pulled from small config files, and every
+result row is tagged with which (model, hardware) combination produced it.
+
+```
+/configs/models/qwen3-4b-instruct-2507-awq.yaml
+    hf_repo: Qwen/Qwen3-4B-Instruct-2507   (AWQ variant)
+    quantization: awq
+    native_context_length: 262144
+
+/configs/hardware/rtx5070-laptop.yaml
+    gpu_name: RTX 5070 Laptop
+    vram_gb: 8
+```
+
+Adding a model or a machine later — e.g. `mistral-7b-instruct-awq.yaml` +
+`rtx4090.yaml` once that box is available — means adding a config file, not
+touching serving/loadgen/eval code. `/results/` keys every row by
+`(model, hardware, eviction_aggressiveness)`, so the same plotting code that
+produces the primary throughput-vs-quality curve can also facet by model or
+hardware once more than one of each exists.
+
+```mermaid
+flowchart LR
+    MC["/configs/models/*.yaml"] --> RUN["serving / loadgen / eval\n(read config, no hardcoded model)"]
+    HC["/configs/hardware/*.yaml"] --> RUN
+    RUN --> TAG["results tagged by\n(model, hardware, aggressiveness)"]
+    TAG --> NOW["Now: 1 model x 1 GPU\n(Qwen3-4B x RTX 5070)"]
+    TAG -.later, same code.-> NEXT["Later: N models x 2 GPUs\n(+ Mistral/Llama-class x RTX 4090)"]
+```
+
+**Scope for the implementation plan below:** build and validate the config-driven
+tool against today's single (model, hardware) pair. Extending the model/hardware
+config set to the 4090 is a distinct follow-on phase (§10, milestone 9) — not
+blocked on any redesign, since the config abstraction is what milestones 1-8
+are built against from the start.
+
+## 4. System architecture
 
 ```mermaid
 flowchart TB
@@ -87,7 +129,7 @@ official vLLM extension point — none is merged yet). This is documented explic
 in the README, per the "document clearly anywhere you must patch internals"
 requirement.
 
-## 4. Eviction policy: StreamingLLM-style
+## 5. Eviction policy: StreamingLLM-style
 
 ```mermaid
 flowchart LR
@@ -109,7 +151,7 @@ flowchart LR
   more throughput/memory headroom, more expected quality loss. This is the
   independent variable swept across the tradeoff curve.
 
-## 5. Request flow (single request, sequence diagram)
+## 6. Request flow (single request, sequence diagram)
 
 ```mermaid
 sequenceDiagram
@@ -133,7 +175,7 @@ sequenceDiagram
     LG->>LG: append record to results CSV
 ```
 
-## 6. Load generator design (`/loadgen/`)
+## 7. Load generator design (`/loadgen/`)
 
 - Async Python client (`httpx`/`asyncio`) against vLLM's OpenAI-compatible API.
 - **Arrivals:** Poisson process, configurable rate (λ) — drives concurrency.
@@ -158,7 +200,7 @@ flowchart TB
     METRICS --> CSV["results/raw/*.csv"]
 ```
 
-## 7. Quality evaluation (`/eval/`)
+## 8. Quality evaluation (`/eval/`)
 
 - **Benchmark:** LongBench, subset selection justified by (a) fitting within our
   configured max sequence length given the 8GB budget, and (b) spanning task types
@@ -170,7 +212,7 @@ flowchart TB
 - Run once per eviction aggressiveness setting (including baseline), diffed against
   baseline to produce "% accuracy drop."
 
-## 8. Results (`/results/`)
+## 9. Results (`/results/`)
 
 ```mermaid
 flowchart LR
@@ -184,37 +226,45 @@ Raw CSV/JSON per run is kept under `/results/raw/`; the plotting script is
 deterministic and re-runnable from those files alone (no need to re-run the
 benchmark to regenerate the plot).
 
-## 9. Repository structure
+## 10. Repository structure
 
 ```
 /serving/        - vLLM integration + eviction policy plugin
 /loadgen/        - concurrent request load generator
 /eval/           - LongBench harness + accuracy scoring
 /results/        - raw benchmark output (CSV/JSON) + plots
+/configs/models/ - one YAML per model (hf repo, quantization, context length)
+/configs/hardware/ - one YAML per machine (GPU name, VRAM budget)
 /docs/           - specs and design docs (this file lives here)
 /README.md       - problem statement, method, reproducible instructions, results
 /.gitignore      - excludes model weights, checkpoints, logs, venvs
 ```
 
-## 10. Milestone plan (each an independent, committable step)
+## 11. Milestone plan (each an independent, committable step)
 
 ```mermaid
 flowchart TB
-    M1["1. Scaffold\ndirs, .gitignore, README skeleton"]
-    M2["2. Baseline vLLM serving\ninstall on RTX 5070, verify sm_120,\nserve Qwen3-4B-AWQ, smoke test"]
+    M1["1. Scaffold\ndirs, .gitignore, README skeleton,\n/configs schema"]
+    M2["2. Baseline vLLM serving\nconfig-driven: RTX 5070 profile +\nQwen3-4B-AWQ config, smoke test"]
     M3["3. Load generator vs. baseline\nPoisson load, CSV output,\nsanity-checked throughput"]
     M4["4. Eviction policy implemented\nsink+window, toggleable at startup"]
     M5["5. Sweep across aggressiveness\nthroughput-side results collected"]
     M6["6. LongBench subset eval harness\nperplexity + accuracy, baseline\n+ each aggressiveness setting"]
     M7["7. Combine into tradeoff plot\n+ results table"]
     M8["8. README\nmethod, repro commands, results,\nlimitations"]
+    M9["9. Phase 2 (later): add RTX 4090\n+ additional model config(s),\nre-run sweep, facet results by\nmodel/hardware"]
 
-    M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8
+    M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 -.follow-on, not blocking.-> M9
 ```
 
-Each milestone is a real commit — no dumping everything as one commit.
+Each milestone is a real commit — no dumping everything as one commit. Milestones
+1-8 are this implementation plan's scope: build and validate the config-driven
+tool on the hardware in hand (RTX 5070, Qwen3-4B). Milestone 9 — bringing in the
+RTX 4090 and additional model configs for more data points — starts once 1-8 are
+done and the tool is proven to work; it reuses the same code, adding config files
+rather than redesigning anything (§3).
 
-## 11. Known risks / open technical items (not decisions — spikes for milestone 2)
+## 12. Known risks / open technical items (not decisions — spikes for milestone 2)
 
 - vLLM's own CUDA kernels (FlashInfer, quantization kernels) for sm_120
   (Blackwell) have been catching up through 2026; may need a recent vLLM release
@@ -225,13 +275,14 @@ Each milestone is a real commit — no dumping everything as one commit.
 - LongBench task subset finalized once max sequence length is confirmed against
   actual available KV-cache budget on this GPU.
 
-## 12. Limitations to carry into the README (known up front)
+## 13. Limitations to carry into the README (known up front)
 
-- Single consumer GPU, shared with a desktop session — available VRAM is not
-  perfectly stable across runs; this is disclosed, not hidden.
+- Single consumer GPU for the milestone 1-8 results, shared with a desktop
+  session — available VRAM is not perfectly stable across runs; this is
+  disclosed, not hidden. (Addressed for a second data point in milestone 9.)
 - Eviction policy is position-based (StreamingLLM-style), not content-aware —
   expected to break down on tasks requiring precise recall of specific early-
   context details that aren't near a sink or the recent window. This is the
   expected, honest failure mode to report on, not a bug to fix.
-- One model size (4B) — the code is structured so a second size could be added
-  later for a scaling comparison, but that is out of scope for this pass.
+- Model/hardware coverage starts at one pair (Qwen3-4B x RTX 5070); breadth
+  comes from milestone 9 onward, not from this initial pass.
