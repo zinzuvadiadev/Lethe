@@ -1,0 +1,3 @@
+name: rtx5070-laptop
+gpu_name: NVIDIA GeForce RTX 5070 Laptop GPU
+vram_gb: 8

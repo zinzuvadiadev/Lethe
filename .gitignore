@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.env
+
+# model weights / HF cache — never commit (anchored to repo root so this
+# doesn't also match configs/models/, which holds tracked config YAML)
+/models/
+/.cache/
+*.safetensors
+*.bin
+*.gguf
+
+# vllm / server logs
+*.log
+nohup.out
