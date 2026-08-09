@@ -112,10 +112,11 @@ def render_dashboard(
     commits_html = "".join(_render_commit(c) for c in commits) or "<p>No commits yet.</p>"
 
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>KV-Cache Benchmark — Results Dashboard</title>
+<html><head><meta charset="utf-8"><title>Lethe — Results Dashboard</title>
 <style>{_STYLE}</style></head>
 <body><div class="sheet">
-<h1>KV-Cache Benchmark — Results Dashboard</h1>
+<h1>Lethe</h1>
+<p style="font-family: var(--sans); color: var(--ink-muted); margin-top: -1rem;">KV-cache eviction policy + throughput/quality benchmark — results dashboard</p>
 
 <h2>Trials</h2>
 {trials_html}
