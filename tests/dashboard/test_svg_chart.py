@@ -15,3 +15,13 @@ def test_latency_distribution_svg_empty_input_returns_valid_empty_svg():
 def test_latency_distribution_svg_all_identical_values_does_not_crash():
     svg = latency_distribution_svg([2.0, 2.0, 2.0], n_bins=4)
     assert svg.count("<rect") == 4
+
+
+def test_latency_distribution_svg_bars_are_rounded():
+    svg = latency_distribution_svg([1.0, 2.0, 3.0], n_bins=3)
+    assert 'rx="1.5"' in svg
+
+
+def test_latency_distribution_svg_includes_baseline_axis_even_when_empty():
+    svg = latency_distribution_svg([])
+    assert 'class="chart-axis"' in svg

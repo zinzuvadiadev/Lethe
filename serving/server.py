@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -22,7 +23,13 @@ def find_pip_cuda_home(site_packages: Path) -> Path | None:
     return None
 
 
-def build_serve_args(model_cfg: ModelConfig, hw_cfg: HardwareConfig, port: int = 8000) -> list[str]:
+def build_serve_args(
+    model_cfg: ModelConfig,
+    hw_cfg: HardwareConfig,
+    port: int = 8000,
+    sink_len: int | None = None,
+    recent_window: int | None = None,
+) -> list[str]:
     # --quantization is deliberately NOT passed here: vLLM auto-detects it
     # from the checkpoint's own config.json, and forcing a value that doesn't
     # exactly match the checkpoint's internal quant_method label (e.g. this
@@ -36,7 +43,7 @@ def build_serve_args(model_cfg: ModelConfig, hw_cfg: HardwareConfig, port: int =
     # (desktop overhead + fragmentation) — observed a real CUDA OOM with
     # only 91MB free during activation-memory allocation at 0.85.
     gpu_util = 0.75 if hw_cfg.vram_gb <= 12 else 0.9
-    return [
+    args = [
         "vllm",
         "serve",
         model_cfg.hf_repo,
@@ -45,35 +52,51 @@ def build_serve_args(model_cfg: ModelConfig, hw_cfg: HardwareConfig, port: int =
         "--gpu-memory-utilization", str(gpu_util),
         "--port", str(port),
     ]
+    if sink_len is not None and recent_window is not None:
+        # See docs/superpowers/specs/2026-08-09-kv-cache-eviction-benchmark-design.md
+        # §6: reuses vLLM's existing RSWA machinery via a model-class
+        # override + scheduler override, both real vllm serve CLI flags
+        # resolved by lazy import inside the subprocess (main() sets
+        # PYTHONPATH so serving.eviction.* is importable there).
+        #
+        # NOTE the two flags use different qualname formats, confirmed by
+        # reading vLLM's actual resolvers: --model-class-overrides values
+        # are parsed by ModelRegistry as "module:ClassName" (colon), but
+        # --scheduler-cls is resolved by resolve_obj_by_qualname() (vllm/
+        # utils/import_utils.py), which does qualname.rsplit(".", 1) — a
+        # plain dotted path, no colon. Passing the colon form here made
+        # vLLM raise AttributeError: module 'serving.eviction' has no
+        # attribute 'sink_scheduler:SinkScheduler' (it split on the last
+        # dot inside "eviction.sink_scheduler:SinkScheduler" and tried to
+        # import "serving.eviction" then getattr the whole colon string).
+        overrides = json.dumps({"Qwen3ForCausalLM": "serving.eviction.sink_model:SinkQwen3ForCausalLM"})
+        args += ["--model-class-overrides", overrides]
+        args += ["--scheduler-cls", "serving.eviction.sink_scheduler.SinkScheduler"]
+    return args
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Launch a config-driven vLLM server")
-    parser.add_argument("--model-config", required=True)
-    parser.add_argument("--hardware-config", required=True)
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-
-    model_cfg = load_model_config(args.model_config)
-    hw_cfg = load_hardware_config(args.hardware_config)
-    argv = build_serve_args(model_cfg, hw_cfg, port=args.port)
+def build_serve_env(
+    sink_len: int | None,
+    recent_window: int | None,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
     venv_bin = Path(sys.executable).parent
-    # Resolve the console-script path explicitly: subprocess.run inherits our
-    # PATH, which won't include .venv/bin unless the venv was activated (we
-    # invoke .venv/bin/python directly instead), so a bare "vllm" lookup fails.
-    argv[0] = str(venv_bin / "vllm")
-
-    env = os.environ.copy()
+    env = dict(base_env) if base_env is not None else os.environ.copy()
     # .venv/bin also holds pip-installed build tools (ninja) that vLLM's
     # runtime JIT kernel compilation (flashinfer) shells out to by bare name;
     # without it on PATH those subprocess lookups fail with FileNotFoundError.
     env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+    # repo root on PYTHONPATH: --model-class-overrides/--scheduler-cls
+    # resolve "serving.eviction.*:ClassName" by lazy import INSIDE this
+    # subprocess, which needs the repo root importable, not just our own
+    # (parent) process's sys.path.
+    repo_root = Path(__file__).resolve().parent.parent
+    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
     site_packages = venv_bin.parent / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
     cuda_home = find_pip_cuda_home(site_packages)
     if cuda_home is not None and "CUDA_HOME" not in env:
         env["CUDA_HOME"] = str(cuda_home)
         env["PATH"] = f"{cuda_home / 'bin'}{os.pathsep}{env['PATH']}"
-        print(f"CUDA_HOME not set; using pip-installed CUDA toolkit at {cuda_home}")
 
     # FlashInfer's JIT-compiled top-k/top-p sampling kernel fails to build on
     # this GPU/CUDA-toolkit combination: its bundled CCCL headers reject the
@@ -82,6 +105,41 @@ def main() -> None:
     # vLLM's PyTorch-native sampler, which doesn't hit that JIT path.
     env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
+    if sink_len is not None:
+        env["LETHE_SINK_LEN"] = str(sink_len)
+    if recent_window is not None:
+        env["LETHE_RSWA_WINDOW"] = str(recent_window)
+    return env
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Launch a config-driven vLLM server")
+    parser.add_argument("--model-config", required=True)
+    parser.add_argument("--hardware-config", required=True)
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--sink-len", type=int, default=None,
+        help="Enable eviction: protect this many leading tokens (requires --recent-window too)",
+    )
+    parser.add_argument(
+        "--recent-window", type=int, default=None,
+        help="Enable eviction: protect this many trailing tokens (requires --sink-len too)",
+    )
+    args = parser.parse_args()
+
+    model_cfg = load_model_config(args.model_config)
+    hw_cfg = load_hardware_config(args.hardware_config)
+    argv = build_serve_args(
+        model_cfg, hw_cfg, port=args.port,
+        sink_len=args.sink_len, recent_window=args.recent_window,
+    )
+    venv_bin = Path(sys.executable).parent
+    # Resolve the console-script path explicitly: subprocess.run inherits our
+    # PATH, which won't include .venv/bin unless the venv was activated (we
+    # invoke .venv/bin/python directly instead), so a bare "vllm" lookup fails.
+    argv[0] = str(venv_bin / "vllm")
+
+    env = build_serve_env(args.sink_len, args.recent_window)
     print(f"launching: {' '.join(argv)}")
     subprocess.run(argv, check=True, env=env)
 

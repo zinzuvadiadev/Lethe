@@ -151,7 +151,134 @@ flowchart LR
   more throughput/memory headroom, more expected quality loss. This is the
   independent variable swept across the tradeoff curve.
 
-## 6. Request flow (single request, sequence diagram)
+## 6. vLLM integration architecture (confirmed against vLLM 0.26.0 source)
+
+§3's original framing — "subclass/wrap `KVCacheManager`" — undersold this once we
+actually read the installed source. Three rounds of investigation (see commit
+history for the full findings) landed on a concrete, buildable plan that reuses
+existing vLLM machinery rather than inventing new attention-kernel masking:
+
+**The key discovery:** vLLM already ships "R-SWA" (Reference Sliding Window
+Attention) — `RSWAAttention`/`RSWASpec`/`RSWAManager` — which does *exactly*
+"protect a front region + a recent window, evict the middle of a still-running
+request's KV cache," including all the attention-kernel-level masking
+(`rswa_mask_mod`) needed for correctness. It's just hardcoded today to protect
+the *whole prompt* as the front region, for exactly one model (DeepSeek-V2
+variants). Our eviction policy is "the same mechanism, with a configurable
+sink length instead of always-the-full-prompt" — reuse, not reimplementation.
+
+```mermaid
+flowchart TB
+    subgraph OURS["Our code (serving/eviction/)"]
+        M1["SinkQwen3Attention\n(Qwen3Attention, with attn_cls swapped\nto RSWAAttention when sink_window set)"]
+        M2["SinkQwen3ForCausalLM\n(wires the above into Qwen3Model\nvia decoder_layer_type)"]
+        M3["Scheduler subclass\n(monkeypatches one bound method:\ncoordinator.remove_skipped_blocks,\nclamps prompt_len → min(sink_len, prompt_len))"]
+    end
+    subgraph VLLM["Stock vLLM 0.26.0 (untouched installed source)"]
+        V1["RSWAAttention / RSWASpec\n(already exists, used verbatim)"]
+        V2["RSWAManager.remove_skipped_blocks\n(already exists, used verbatim)"]
+        V3["rswa_mask_mod (FlashAttention backend)\n(already exists, used verbatim —\nwe only use FLASH_ATTN in this deployment)"]
+    end
+    CLI["vllm serve --model-class-overrides ...\n--scheduler-cls ...\n(plain CLI flags, resolved by\nlazy import inside the vllm subprocess)"]
+
+    CLI -->|"model_class_overrides"| M2
+    CLI -->|"scheduler_cls"| M3
+    M1 --> V1
+    M2 --> M1
+    M3 -.wraps, doesn't replace.-> V2
+    V1 --> V3
+```
+
+- **Attention layer** (`SinkQwen3Attention`): a from-scratch `nn.Module`
+  reproducing `Qwen3Attention.__init__` with one line changed — construct
+  `RSWAAttention(..., rswa_window=W)` instead of `Attention(...)` when a
+  window is configured. This mirrors the exact pattern vLLM's own
+  `deepseek_v2.py` already uses; not a novel technique.
+- **Model class** (`SinkQwen3ForCausalLM`): thin subclass of `Qwen3Model`
+  that passes `decoder_layer_type=SinkQwen3DecoderLayer` (itself a thin
+  subclass of `Qwen3DecoderLayer` constructing `SinkQwen3Attention`) —
+  `Qwen2Model.__init__` (which `Qwen3Model` reuses) already accepts this as
+  a constructor parameter, no upstream override needed.
+- **Sink boundary**: `RSWAManager.remove_skipped_blocks` treats whatever
+  value is passed as `num_prompt_tokens` as the protected-front-region
+  boundary — it has no semantic dependency on that value actually being the
+  prompt length. There is exactly one place this value is sourced
+  (`KVCacheCoordinator.remove_skipped_blocks`, called from
+  `KVCacheManager`'s per-step allocation path), so a **single monkeypatch**
+  — replacing the already-constructed coordinator instance's
+  `remove_skipped_blocks` bound method with a thin wrapper that clamps
+  `num_prompt_tokens` to `min(sink_len, num_prompt_tokens)` before calling
+  the original — covers every call path (the main per-step allocation path
+  *and* the separate connector-cleanup path) with one attribute
+  reassignment. Done inside our own `Scheduler` subclass's `__init__`,
+  right after `super().__init__()` constructs the real `KVCacheManager`.
+- **Wiring into the running server**: both `--model-class-overrides` and
+  `--scheduler-cls` are real `vllm serve` CLI flags that accept
+  `"module:ClassName"` strings, lazily imported *inside the vllm
+  subprocess* when the engine resolves them — no explicit registration call
+  needed in our own process, and no vLLM source file is edited. This does
+  mean `serving/server.py`'s subprocess launch needs `PYTHONPATH` set to
+  include the repo root so `serving.eviction.*` is importable from inside
+  that subprocess (same category of fix as the `PATH`/`CUDA_HOME` issues
+  already hit in milestone 2).
+- **Aggressiveness knob → config**: recent-window size `W` and sink length
+  are both read from environment variables (`LETHE_RSWA_WINDOW`,
+  `LETHE_SINK_LEN`) set by `serving/server.py` on the subprocess it
+  launches — the same pattern already used for
+  `VLLM_USE_FLASHINFER_SAMPLER` in milestone 2. Since `SinkQwen3ForCausalLM`
+  and the `Scheduler` subclass are entirely our own code (not tricking
+  vLLM's stock classes via external HF-config mutation, the way vLLM's own
+  `UnlimitedOCR` support does for its unmodified DeepSeek base), reading our
+  own env vars directly is simpler than round-tripping values through the
+  model's HF config object.
+- **Scope-limiting fact used throughout**: this deployment only ever
+  selects the `FLASH_ATTN` attention backend (confirmed from this
+  project's own server logs), so only that backend's `rswa_mask_mod` needs
+  to work — no need to touch or test FlexAttention/Triton's copies.
+
+**What this deliberately does NOT do:** free blocks belonging to a request
+that's still in its prefill/prompt phase (RSWA's gap logic only ever frees
+blocks *behind* the current decode window, never inside an unprocessed
+prompt), and does not attempt to keep FlexAttention/Triton backends working
+(out of scope — this deployment doesn't use them).
+
+**Confirmed working, live (2026-08-10):** implemented per milestone 4's
+plan and verified against the running server. Two fixes surfaced during
+verification, both now folded into the code:
+- `--scheduler-cls` and `--model-class-overrides` turned out to use
+  *different* qualname formats — `--model-class-overrides` values are
+  `"module:ClassName"` (colon), but `--scheduler-cls` is resolved by
+  `resolve_obj_by_qualname()` (`vllm/utils/import_utils.py`), which does
+  `qualname.rsplit(".", 1)` — a plain dotted path. Passing the colon form
+  for `--scheduler-cls` raised `AttributeError: module 'serving.eviction'
+  has no attribute 'sink_scheduler:SinkScheduler'`. Fixed in
+  `serving/server.py` (`SinkScheduler`'s value uses `.`, not `:`).
+- Live A/B evidence that eviction actually bounds memory: sent the
+  identical 2500-max-token completion request to both servers and sampled
+  vLLM's own `vllm:kv_cache_usage_perc` metric (from `/metrics`) every 3s
+  during generation.
+  - **Eviction enabled** (`--sink-len 64 --recent-window 512`): usage held
+    flat at **0.0375** for the entire generation (6 consecutive identical
+    samples across ~18s) — matching the predicted
+    `(sink_len + recent_window) / kv_cache_size_tokens = 576 / 14959 ≈
+    0.0385` almost exactly — then dropped to 0 on completion. Request
+    succeeded (200, 10,471 chars generated).
+  - **Baseline** (no eviction, identical prompt/max_tokens): usage grew
+    monotonically and roughly linearly — 0.017 → 0.034 → 0.050 → 0.064 →
+    0.079 → 0.094 → 0.108 → 0.125 → 0.141 → 0.157 across 10 samples (~30s)
+    — over 4x the eviction plateau by the last sample, with no sign of
+    leveling off. Request also succeeded (200, 10,838 chars generated) —
+    this deployment's context budget is large enough that a single 2500-
+    token request doesn't itself trigger OOM even without eviction, which
+    is exactly why the *usage-metric* comparison (not a pass/fail
+    completion check) is the correct verification signal here.
+
+  This is decisive: identical request, identical model, only the eviction
+  policy differs, and the KV-cache-memory-vs-generation-length curves are
+  qualitatively different (flat vs. linear) — confirming the policy is
+  genuinely engaging and bounding memory, not silently inert.
+
+## 7. Request flow (single request, sequence diagram)
 
 ```mermaid
 sequenceDiagram
@@ -175,7 +302,7 @@ sequenceDiagram
     LG->>LG: append record to results CSV
 ```
 
-## 7. Load generator design (`/loadgen/`)
+## 8. Load generator design (`/loadgen/`)
 
 - Async Python client (`httpx`/`asyncio`) against vLLM's OpenAI-compatible API.
 - **Arrivals:** Poisson process, configurable rate (λ) — drives concurrency.
@@ -200,7 +327,7 @@ flowchart TB
     METRICS --> CSV["results/raw/*.csv"]
 ```
 
-## 8. Quality evaluation (`/eval/`)
+## 9. Quality evaluation (`/eval/`)
 
 - **Benchmark:** LongBench, subset selection justified by (a) fitting within our
   configured max sequence length given the 8GB budget, and (b) spanning task types
@@ -212,7 +339,7 @@ flowchart TB
 - Run once per eviction aggressiveness setting (including baseline), diffed against
   baseline to produce "% accuracy drop."
 
-## 9. Results (`/results/`)
+## 10. Results (`/results/`)
 
 ```mermaid
 flowchart LR
@@ -226,7 +353,7 @@ Raw CSV/JSON per run is kept under `/results/raw/`; the plotting script is
 deterministic and re-runnable from those files alone (no need to re-run the
 benchmark to regenerate the plot).
 
-## 10. Repository structure
+## 11. Repository structure
 
 ```
 /serving/        - vLLM integration + eviction policy plugin
@@ -240,7 +367,7 @@ benchmark to regenerate the plot).
 /.gitignore      - excludes model weights, checkpoints, logs, venvs
 ```
 
-## 11. Milestone plan (each an independent, committable step)
+## 12. Milestone plan (each an independent, committable step)
 
 ```mermaid
 flowchart TB
@@ -264,7 +391,7 @@ RTX 4090 and additional model configs for more data points — starts once 1-8 a
 done and the tool is proven to work; it reuses the same code, adding config files
 rather than redesigning anything (§3).
 
-## 12. Known risks / open technical items (not decisions — spikes for milestone 2)
+## 13. Known risks / open technical items (not decisions — spikes for milestone 2)
 
 - vLLM's own CUDA kernels (FlashInfer, quantization kernels) for sm_120
   (Blackwell) have been catching up through 2026; may need a recent vLLM release
@@ -275,7 +402,7 @@ rather than redesigning anything (§3).
 - LongBench task subset finalized once max sequence length is confirmed against
   actual available KV-cache budget on this GPU.
 
-## 13. Limitations to carry into the README (known up front)
+## 14. Limitations to carry into the README (known up front)
 
 - Single consumer GPU for the milestone 1-8 results, shared with a desktop
   session — available VRAM is not perfectly stable across runs; this is

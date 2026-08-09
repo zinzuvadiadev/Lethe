@@ -7,8 +7,12 @@ def latency_distribution_svg(
     height: int = 80,
     n_bins: int = 12,
 ) -> str:
+    baseline = f'<line x1="0" y1="{height - 0.5}" x2="{width}" y2="{height - 0.5}" class="chart-axis" />'
     if not latencies:
-        return f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}"></svg>'
+        return (
+            f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
+            f"{baseline}</svg>"
+        )
 
     lo, hi = min(latencies), max(latencies)
     span = (hi - lo) or 1.0
@@ -20,14 +24,14 @@ def latency_distribution_svg(
     max_count = max(counts) or 1
 
     bar_w = width / n_bins
-    bars = []
+    bars = [baseline]
     for i, c in enumerate(counts):
-        bar_h = (c / max_count) * (height - 4)
+        bar_h = (c / max_count) * (height - 6)
         x = i * bar_w
-        y = height - bar_h
+        y = height - bar_h - 1
         bars.append(
             f'<rect x="{x:.1f}" y="{y:.1f}" width="{max(bar_w - 1, 0):.1f}" '
-            f'height="{bar_h:.1f}" />'
+            f'height="{bar_h:.1f}" rx="1.5" />'
         )
     return (
         f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
