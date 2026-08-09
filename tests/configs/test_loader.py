@@ -20,7 +20,7 @@ def test_load_model_config_reads_qwen3_4b_awq():
         served_model_name="qwen3-4b-instruct-2507",
         quantization="awq",
         native_context_length=262144,
-        max_context_length=32768,
+        max_context_length=6000,
     )
 
 

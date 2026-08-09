@@ -3,4 +3,4 @@ hf_repo: cpatonn/Qwen3-4B-Instruct-2507-AWQ-4bit
 served_model_name: qwen3-4b-instruct-2507
 quantization: awq
 native_context_length: 262144
-max_context_length: 32768
+max_context_length: 6000
