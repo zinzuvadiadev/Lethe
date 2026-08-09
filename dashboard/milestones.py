@@ -9,20 +9,38 @@ class Milestone:
     number: int
     name: str
     marker_path: str
+    # If set, marker_path must exist AND NOT contain this text to count as
+    # done. Used for milestones (like README) whose marker file exists from
+    # the initial scaffold as a placeholder and only becomes "done" once
+    # real content replaces it.
+    placeholder_text: str | None = None
 
 
+# Mirrors design doc §11 (docs/superpowers/specs/2026-08-09-kv-cache-eviction-
+# benchmark-design.md) exactly — the 9 real project milestones, not the
+# finer-grained per-plan task breakdown.
 MILESTONES: tuple[Milestone, ...] = (
     Milestone(1, "Scaffold", "pytest.ini"),
-    Milestone(2, "Config module", "configs/loader.py"),
-    Milestone(3, "GPU + vLLM verification", "serving/verify_gpu.py"),
-    Milestone(4, "Config-driven server + smoke test", "serving/server.py"),
-    Milestone(5, "Load generator sampling", "loadgen/sampling.py"),
-    Milestone(6, "Load generator HTTP client", "loadgen/client.py"),
-    Milestone(7, "Load generator runner + baseline run", "results/raw/baseline.csv"),
-    Milestone(8, "LongBench eval harness", "eval/harness.py"),
-    Milestone(9, "RTX 4090 phase", "configs/hardware/rtx4090.yaml"),
+    Milestone(2, "Baseline vLLM serving", "serving/server.py"),
+    Milestone(3, "Load generator vs. baseline", "results/raw/baseline.csv"),
+    Milestone(4, "Eviction policy implemented", "serving/eviction.py"),
+    Milestone(5, "Sweep across aggressiveness", "results/raw/aggressiveness_sweep.csv"),
+    Milestone(6, "LongBench subset eval harness", "eval/harness.py"),
+    Milestone(7, "Combine into tradeoff plot", "results/tradeoff_plot.png"),
+    Milestone(8, "README", "README.md", placeholder_text="_Filled in at milestone"),
+    Milestone(9, "Phase 2 (later): RTX 4090", "configs/hardware/rtx4090.yaml"),
 )
 
 
 def milestone_status(repo_root: Path) -> list[tuple[Milestone, bool]]:
-    return [(m, (repo_root / m.marker_path).exists()) for m in MILESTONES]
+    results: list[tuple[Milestone, bool]] = []
+    for m in MILESTONES:
+        path = repo_root / m.marker_path
+        if not path.exists():
+            done = False
+        elif m.placeholder_text is not None:
+            done = m.placeholder_text not in path.read_text()
+        else:
+            done = True
+        results.append((m, done))
+    return results
