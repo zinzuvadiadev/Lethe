@@ -23,7 +23,7 @@ MILESTONES: tuple[Milestone, ...] = (
     Milestone(1, "Scaffold", "pytest.ini"),
     Milestone(2, "Baseline vLLM serving", "serving/server.py"),
     Milestone(3, "Load generator vs. baseline", "results/raw/baseline.csv"),
-    Milestone(4, "Eviction policy implemented", "serving/eviction.py"),
+    Milestone(4, "Eviction policy implemented", "serving/eviction/sink_scheduler.py"),
     Milestone(5, "Sweep across aggressiveness", "results/raw/aggressiveness_sweep.csv"),
     Milestone(6, "LongBench subset eval harness", "eval/harness.py"),
     Milestone(7, "Combine into tradeoff plot", "results/tradeoff_plot.png"),
