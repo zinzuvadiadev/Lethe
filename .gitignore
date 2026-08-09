@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.env
+
+# model weights / HF cache — never commit
+models/
+.cache/
+*.safetensors
+*.bin
+*.gguf
+
+# vllm / server logs
+*.log
+nohup.out
