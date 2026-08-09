@@ -6,3 +6,4 @@ respx>=0.21
 numpy>=1.26
 pandas>=2.2
 matplotlib>=3.9
+vllm==0.26.0
