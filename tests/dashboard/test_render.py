@@ -52,3 +52,45 @@ def test_render_dashboard_includes_commit_subjects():
     html = render_dashboard(trials=[], commits=commits, milestones=[])
     assert "Add thing" in html
     assert "abc1234" in html
+
+
+def test_render_dashboard_shows_milestone_progress_summary():
+    milestones = [(Milestone(1, "Scaffold", "x"), True), (Milestone(2, "Config module", "y"), False)]
+    html = render_dashboard(trials=[], commits=[], milestones=milestones)
+    assert "1 of 2 milestones complete" in html
+
+
+def test_render_dashboard_pill_reflects_high_success_rate():
+    trial = TrialReport(
+        filename="good.csv", is_loadgen_schema=True, row_count=10, columns=[],
+        loadgen_summary=LoadgenSummary(
+            row_count=10, success_rate=1.0, p50_latency_sec=1.0,
+            p95_latency_sec=2.0, mean_ttft_sec=0.1,
+        ),
+        preview_rows=[],
+    )
+    html = render_dashboard(trials=[trial], commits=[], milestones=[])
+    assert "pill-success" in html
+
+
+def test_render_dashboard_pill_reflects_low_success_rate():
+    trial = TrialReport(
+        filename="bad.csv", is_loadgen_schema=True, row_count=10, columns=[],
+        loadgen_summary=LoadgenSummary(
+            row_count=10, success_rate=0.5, p50_latency_sec=1.0,
+            p95_latency_sec=2.0, mean_ttft_sec=0.1,
+        ),
+        preview_rows=[],
+    )
+    html = render_dashboard(trials=[trial], commits=[], milestones=[])
+    assert "pill-danger" in html
+
+
+def test_render_dashboard_includes_generated_at_when_provided():
+    html = render_dashboard(trials=[], commits=[], milestones=[], generated_at="2026-08-10 12:00 UTC")
+    assert "2026-08-10 12:00 UTC" in html
+
+
+def test_render_dashboard_omits_generated_at_when_not_provided():
+    html = render_dashboard(trials=[], commits=[], milestones=[])
+    assert '<p class="generated-at">' not in html
