@@ -221,12 +221,16 @@ flowchart TB
   include the repo root so `serving.eviction.*` is importable from inside
   that subprocess (same category of fix as the `PATH`/`CUDA_HOME` issues
   already hit in milestone 2).
-- **Aggressiveness knob → config**: recent-window size `W` is threaded via
-  `hf_config.rswa_window` (same mechanism vLLM's own `UnlimitedOCR` support
-  uses — a plain `getattr`-duck-typed attribute, no class check); sink
-  length is threaded the same way via our own `hf_config.sink_len`
-  attribute, read by the `Scheduler` subclass. Both get set on the model's
-  HF config object before engine construction.
+- **Aggressiveness knob → config**: recent-window size `W` and sink length
+  are both read from environment variables (`LETHE_RSWA_WINDOW`,
+  `LETHE_SINK_LEN`) set by `serving/server.py` on the subprocess it
+  launches — the same pattern already used for
+  `VLLM_USE_FLASHINFER_SAMPLER` in milestone 2. Since `SinkQwen3ForCausalLM`
+  and the `Scheduler` subclass are entirely our own code (not tricking
+  vLLM's stock classes via external HF-config mutation, the way vLLM's own
+  `UnlimitedOCR` support does for its unmodified DeepSeek base), reading our
+  own env vars directly is simpler than round-tripping values through the
+  model's HF config object.
 - **Scope-limiting fact used throughout**: this deployment only ever
   selects the `FLASH_ATTN` attention backend (confirmed from this
   project's own server logs), so only that backend's `rswa_mask_mod` needs
@@ -237,6 +241,42 @@ that's still in its prefill/prompt phase (RSWA's gap logic only ever frees
 blocks *behind* the current decode window, never inside an unprocessed
 prompt), and does not attempt to keep FlexAttention/Triton backends working
 (out of scope — this deployment doesn't use them).
+
+**Confirmed working, live (2026-08-10):** implemented per milestone 4's
+plan and verified against the running server. Two fixes surfaced during
+verification, both now folded into the code:
+- `--scheduler-cls` and `--model-class-overrides` turned out to use
+  *different* qualname formats — `--model-class-overrides` values are
+  `"module:ClassName"` (colon), but `--scheduler-cls` is resolved by
+  `resolve_obj_by_qualname()` (`vllm/utils/import_utils.py`), which does
+  `qualname.rsplit(".", 1)` — a plain dotted path. Passing the colon form
+  for `--scheduler-cls` raised `AttributeError: module 'serving.eviction'
+  has no attribute 'sink_scheduler:SinkScheduler'`. Fixed in
+  `serving/server.py` (`SinkScheduler`'s value uses `.`, not `:`).
+- Live A/B evidence that eviction actually bounds memory: sent the
+  identical 2500-max-token completion request to both servers and sampled
+  vLLM's own `vllm:kv_cache_usage_perc` metric (from `/metrics`) every 3s
+  during generation.
+  - **Eviction enabled** (`--sink-len 64 --recent-window 512`): usage held
+    flat at **0.0375** for the entire generation (6 consecutive identical
+    samples across ~18s) — matching the predicted
+    `(sink_len + recent_window) / kv_cache_size_tokens = 576 / 14959 ≈
+    0.0385` almost exactly — then dropped to 0 on completion. Request
+    succeeded (200, 10,471 chars generated).
+  - **Baseline** (no eviction, identical prompt/max_tokens): usage grew
+    monotonically and roughly linearly — 0.017 → 0.034 → 0.050 → 0.064 →
+    0.079 → 0.094 → 0.108 → 0.125 → 0.141 → 0.157 across 10 samples (~30s)
+    — over 4x the eviction plateau by the last sample, with no sign of
+    leveling off. Request also succeeded (200, 10,838 chars generated) —
+    this deployment's context budget is large enough that a single 2500-
+    token request doesn't itself trigger OOM even without eviction, which
+    is exactly why the *usage-metric* comparison (not a pass/fail
+    completion check) is the correct verification signal here.
+
+  This is decisive: identical request, identical model, only the eviction
+  policy differs, and the KV-cache-memory-vs-generation-length curves are
+  qualitatively different (flat vs. linear) — confirming the policy is
+  genuinely engaging and bounding memory, not silently inert.
 
 ## 7. Request flow (single request, sequence diagram)
 

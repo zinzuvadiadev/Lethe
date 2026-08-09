@@ -63,4 +63,4 @@ def test_build_serve_args_includes_eviction_flags_when_enabled():
     override_value = args[args.index("--model-class-overrides") + 1]
     assert "serving.eviction.sink_model:SinkQwen3ForCausalLM" in override_value
     assert "Qwen3ForCausalLM" in override_value
-    assert args[args.index("--scheduler-cls") + 1] == "serving.eviction.sink_scheduler:SinkScheduler"
+    assert args[args.index("--scheduler-cls") + 1] == "serving.eviction.sink_scheduler.SinkScheduler"

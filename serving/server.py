@@ -58,9 +58,20 @@ def build_serve_args(
         # override + scheduler override, both real vllm serve CLI flags
         # resolved by lazy import inside the subprocess (main() sets
         # PYTHONPATH so serving.eviction.* is importable there).
+        #
+        # NOTE the two flags use different qualname formats, confirmed by
+        # reading vLLM's actual resolvers: --model-class-overrides values
+        # are parsed by ModelRegistry as "module:ClassName" (colon), but
+        # --scheduler-cls is resolved by resolve_obj_by_qualname() (vllm/
+        # utils/import_utils.py), which does qualname.rsplit(".", 1) — a
+        # plain dotted path, no colon. Passing the colon form here made
+        # vLLM raise AttributeError: module 'serving.eviction' has no
+        # attribute 'sink_scheduler:SinkScheduler' (it split on the last
+        # dot inside "eviction.sink_scheduler:SinkScheduler" and tried to
+        # import "serving.eviction" then getattr the whole colon string).
         overrides = json.dumps({"Qwen3ForCausalLM": "serving.eviction.sink_model:SinkQwen3ForCausalLM"})
         args += ["--model-class-overrides", overrides]
-        args += ["--scheduler-cls", "serving.eviction.sink_scheduler:SinkScheduler"]
+        args += ["--scheduler-cls", "serving.eviction.sink_scheduler.SinkScheduler"]
     return args
 
 
