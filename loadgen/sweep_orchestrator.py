@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from configs.loader import HardwareConfig, ModelConfig
@@ -11,6 +12,14 @@ from loadgen.server_lifecycle import (
     stop_server,
     wait_for_server_ready,
 )
+
+# Real failure observed running the 5-point sweep live: launching the next
+# setting's server immediately after stop_server() returned raced the CUDA
+# driver's GPU memory release from the just-terminated process, producing a
+# CUDA OOM ("33MB free") during the next server's init even though nvidia-smi
+# showed a clean ~900MB baseline moments later. A short settle delay after
+# each teardown avoids the race.
+GPU_SETTLE_DELAY_SEC = 5.0
 
 
 async def run_aggressiveness_sweep(
@@ -54,5 +63,6 @@ async def run_aggressiveness_sweep(
             output_paths.append(out_path)
         finally:
             stop_server(process)
+            await asyncio.sleep(GPU_SETTLE_DELAY_SEC)
 
     return output_paths

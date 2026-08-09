@@ -52,6 +52,7 @@ async def test_run_aggressiveness_sweep_calls_in_order_per_setting(tmp_path, mon
     monkeypatch.setattr(sweep_orchestrator, "run_sweep", fake_run_sweep)
     monkeypatch.setattr(sweep_orchestrator, "write_csv", fake_write_csv)
     monkeypatch.setattr(sweep_orchestrator, "stop_server", fake_stop)
+    monkeypatch.setattr(sweep_orchestrator, "GPU_SETTLE_DELAY_SEC", 0.0)
 
     paths = await sweep_orchestrator.run_aggressiveness_sweep(
         MODEL, HW, SETTINGS, rate_per_sec=1.0, duration_sec=1.0,
@@ -94,6 +95,7 @@ async def test_run_aggressiveness_sweep_raises_and_stops_server_if_never_ready(t
     monkeypatch.setattr(sweep_orchestrator, "launch_server_background", fake_launch)
     monkeypatch.setattr(sweep_orchestrator, "wait_for_server_ready", fake_wait)
     monkeypatch.setattr(sweep_orchestrator, "stop_server", fake_stop)
+    monkeypatch.setattr(sweep_orchestrator, "GPU_SETTLE_DELAY_SEC", 0.0)
 
     with pytest.raises(RuntimeError, match="did not become ready"):
         await sweep_orchestrator.run_aggressiveness_sweep(
